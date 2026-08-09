@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { motion } from 'framer-motion'
 import { Search, Trophy, Swords, RefreshCw } from 'lucide-react'
 import { useLCUStore } from '../../store'
@@ -54,29 +54,42 @@ const TIER_NAMES: Record<string, string> = {
 }
 
 export default function Career() {
-  const { connected, summoner } = useLCUStore()
+  const { connected, summoner, setConnected } = useLCUStore()
   const [searchName, setSearchName] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [matches, setMatches] = useState<MatchGame[]>([])
   const [rankedInfo, setRankedInfo] = useState<{ solo?: RankedInfo; flex?: RankedInfo }>({})
   const [currentPuuid, setCurrentPuuid] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const activeRequestId = useRef(0)
 
   // Load current summoner's data on mount
   useEffect(() => {
-    if (connected && summoner?.puuid) {
-      loadSummonerData(summoner.puuid)
+    if (connected && summoner?.puuid && currentPuuid === null) {
+      void loadSummonerData(summoner.puuid)
+    } else if (!connected) {
+      activeRequestId.current += 1
+      setIsLoading(false)
+      setCurrentPuuid(null)
+      setMatches([])
+      setRankedInfo({})
     }
-  }, [connected, summoner])
+  }, [connected, summoner?.puuid, currentPuuid])
 
-  const loadSummonerData = async (puuid: string) => {
+  const loadSummonerData = async (puuid: string, existingRequestId?: number) => {
+    const requestId = existingRequestId ?? ++activeRequestId.current
+    if (requestId !== activeRequestId.current) return
+
     setIsLoading(true)
     setError(null)
     setCurrentPuuid(puuid)
+    setMatches([])
+    setRankedInfo({})
 
     try {
       // Load match history
       const historyResult = await window.electronAPI.career.getMatchHistory(puuid, 0, 20)
+      if (requestId !== activeRequestId.current) return
       
       // API返回格式可能是 { games: { games: [...] } } 或 { games: [...] }
       let gamesArray: any[] = []
@@ -99,6 +112,8 @@ export default function Career() {
 
       // Load ranked stats
       const rankedResult = await window.electronAPI.career.getRankedStats(puuid)
+      if (requestId !== activeRequestId.current) return
+
       if (rankedResult?.queueMap) {
         const solo = rankedResult.queueMap.RANKED_SOLO_5x5
         const flex = rankedResult.queueMap.RANKED_FLEX_SR
@@ -119,12 +134,17 @@ export default function Career() {
             losses: flex.losses,
           } : undefined,
         })
+      } else {
+        setRankedInfo({})
       }
     } catch (err: any) {
+      if (requestId !== activeRequestId.current) return
       console.error('Load summoner data error:', err)
       setError(err.message || '加载数据失败')
     } finally {
-      setIsLoading(false)
+      if (requestId === activeRequestId.current) {
+        setIsLoading(false)
+      }
     }
   }
 
@@ -191,29 +211,67 @@ export default function Career() {
   }
 
   const handleSearch = async () => {
-    if (!searchName.trim()) return
+    const query = searchName.trim()
+    if (!query) return
+
+    const requestId = ++activeRequestId.current
     
     setIsLoading(true)
     setError(null)
     
     try {
-      const result = await window.electronAPI.career.getSummonerByName(searchName.trim())
+      const result = await window.electronAPI.career.getSummonerByName(query)
+      if (requestId !== activeRequestId.current) return
+
       if (result?.puuid) {
-        await loadSummonerData(result.puuid)
+        await loadSummonerData(result.puuid, requestId)
       } else {
         setError('未找到该召唤师')
       }
     } catch (err: any) {
+      if (requestId !== activeRequestId.current) return
       setError(err.message || '搜索失败')
     } finally {
-      setIsLoading(false)
+      if (requestId === activeRequestId.current) {
+        setIsLoading(false)
+      }
     }
   }
 
-  const handleBackToMe = () => {
-    if (summoner?.puuid) {
-      loadSummonerData(summoner.puuid)
-      setSearchName('')
+  const handleBackToMe = async () => {
+    const requestId = ++activeRequestId.current
+    setSearchName('')
+    setError(null)
+    setIsLoading(true)
+
+    try {
+      let currentSummoner = summoner
+
+      // LCU may become reachable before the current-summoner plugin is ready.
+      // Resolve it again on demand instead of leaving the button as a no-op.
+      if (!currentSummoner?.puuid) {
+        const status = await window.electronAPI.lcu.getStatus()
+        if (requestId !== activeRequestId.current) return
+
+        if (status.connected && status.summoner?.puuid) {
+          currentSummoner = status.summoner
+          setConnected(true, status.summoner)
+        }
+      }
+
+      if (!currentSummoner?.puuid) {
+        setError('暂时无法获取当前召唤师信息，请稍后重试')
+        return
+      }
+
+      await loadSummonerData(currentSummoner.puuid, requestId)
+    } catch (err: any) {
+      if (requestId !== activeRequestId.current) return
+      setError(err.message || '返回我的战绩失败')
+    } finally {
+      if (requestId === activeRequestId.current) {
+        setIsLoading(false)
+      }
     }
   }
 
@@ -280,9 +338,9 @@ export default function Career() {
             <Search size={18} />
           </button>
         </div>
-        {currentPuuid !== summoner?.puuid && (
+        {currentPuuid !== null && currentPuuid !== summoner?.puuid && (
           <button
-            onClick={handleBackToMe}
+            onClick={() => void handleBackToMe()}
             className="px-4 py-2 bg-lol-gold text-lol-bg-primary rounded-lg font-medium hover:bg-lol-gold-light transition-colors"
           >
             返回我的

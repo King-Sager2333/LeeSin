@@ -11,12 +11,50 @@ export function useLCU() {
   const { addNotification } = useNotificationStore()
   
   useEffect(() => {
+    let disposed = false
+    let summonerRetryTimer: ReturnType<typeof setTimeout> | null = null
+
+    const clearSummonerRetry = () => {
+      if (summonerRetryTimer) {
+        clearTimeout(summonerRetryTimer)
+        summonerRetryTimer = null
+      }
+    }
+
+    const refreshCurrentSummoner = async (attempt: number = 0) => {
+      if (disposed) return
+
+      try {
+        const status = await window.electronAPI.lcu.getStatus()
+        if (disposed || !status.connected) return
+
+        if (status.summoner?.puuid) {
+          setConnected(true, status.summoner)
+          return
+        }
+      } catch {
+        // Retry below while the LCU summoner plugin is still starting.
+      }
+
+      if (attempt < 7 && !disposed) {
+        clearSummonerRetry()
+        summonerRetryTimer = setTimeout(
+          () => void refreshCurrentSummoner(attempt + 1),
+          1000
+        )
+      }
+    }
+
     // 获取初始状态
     const initializeState = async () => {
       try {
         // 获取LCU状态
         const status = await window.electronAPI.lcu.getStatus()
         setConnected(status.connected, status.summoner)
+
+        if (status.connected && !status.summoner?.puuid) {
+          void refreshCurrentSummoner()
+        }
         
         if (status.connected) {
           // 获取游戏流状态
@@ -48,7 +86,11 @@ export function useLCU() {
     
     // 订阅LCU连接事件
     const unsubConnect = window.electronAPI.lcu.onConnected(async (data: { port: number; summoner: Summoner | null }) => {
-      setConnected(true, data.summoner)
+      const knownSummoner = data.summoner || useLCUStore.getState().summoner
+      setConnected(true, knownSummoner)
+      if (!knownSummoner?.puuid) {
+        void refreshCurrentSummoner()
+      }
       addNotification('已连接到LOL客户端', 'success')
       
       // 重新获取数据
@@ -68,6 +110,7 @@ export function useLCU() {
     })
     
     const unsubDisconnect = window.electronAPI.lcu.onDisconnected(() => {
+      clearSummonerRetry()
       setConnected(false)
       setPhase('None')
       setGameMode('ranked', 0)
@@ -108,6 +151,8 @@ export function useLCU() {
     })
     
     return () => {
+      disposed = true
+      clearSummonerRetry()
       unsubConnect()
       unsubDisconnect()
       unsubPhase()
