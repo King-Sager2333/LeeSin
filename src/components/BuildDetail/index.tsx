@@ -167,7 +167,7 @@ export default function BuildDetail({ championId, position = 'mid', mode = 'rank
   const loadBuild = async () => {
     setIsLoading(true)
     try {
-      const needsPosition = mode !== 'arena' && mode !== 'aram-mayhem'
+      const needsPosition = mode === 'ranked'
       const result = await window.electronAPI.data.getChampionBuild(
         championId,
         needsPosition ? position : 'none',

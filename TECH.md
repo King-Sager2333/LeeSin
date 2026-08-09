@@ -165,7 +165,7 @@
     *   **出装**: `GET /api/{region}/champions/{mode}/{championId}/{position}?tier={tier}`
 *   **参数**:
     *   `region`: 例如 `kr`, `na`, `euw`。
-    *   `mode`: `ranked`, `aram`, `arena`。
+    *   `mode`: `ranked`, `aram`, `arena`。`aram-mayhem` 使用 ARAMGG 国服专属统计，并以 ARAM Mayhem 专属站点作为出装备用源，不与普通 ARAM/Arena 数据混合。
     *   `tier`: `emerald_plus`, `diamond_plus`, 等。
 
 ### 4.2. SGP (Spectator Game Platform)

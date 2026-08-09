@@ -1,6 +1,15 @@
 // OP.GG API响应类型
+export interface RecommendationDataSource {
+  kind: 'native' | 'fallback'
+  label: string
+  details?: string
+}
+
 export interface OPGGTierListResponse {
-  meta: { version: string }
+  meta: {
+    version: string
+    dataSource?: RecommendationDataSource
+  }
   data: OPGGChampionTier[]
 }
 
@@ -189,6 +198,7 @@ export interface CachedChampionBuild {
   mode: string
   version: string
   timestamp: number
+  dataSource?: RecommendationDataSource
   summary: {
     winRate: number
     pickRate: number

@@ -4,6 +4,8 @@ import { StaticDataManager } from '../data/static-data'
 import { Logger } from '../../services/logger'
 import type { ChampSelectSession, ChampSelectAction } from '../../../shared/types'
 
+type PickBanAction = Omit<ChampSelectAction, 'type'> & { type: 'pick' | 'ban' }
+
 export interface AutoBPResult {
   executed: boolean
   success: boolean
@@ -86,7 +88,7 @@ export class AutoBP {
     }
   }
   
-  private findMyPendingAction(session: ChampSelectSession): ChampSelectAction | null {
+  private findMyPendingAction(session: ChampSelectSession): PickBanAction | null {
     const localCellId = session.localPlayerCellId
     
     // 遍历所有action回合
@@ -99,7 +101,7 @@ export class AutoBP {
           action.isInProgress &&
           (action.type === 'pick' || action.type === 'ban')
         ) {
-          return action
+          return action as PickBanAction
         }
       }
     }
@@ -109,7 +111,7 @@ export class AutoBP {
   
   private async selectChampion(
     session: ChampSelectSession, 
-    action: ChampSelectAction
+    action: PickBanAction
   ): Promise<number | null> {
     const settings = this.configService.getSettings()
     

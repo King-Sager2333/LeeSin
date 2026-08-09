@@ -6,8 +6,11 @@ import type {
   Champion, 
   RunePage, 
   AppSettings,
+  GameModeContext,
   Item,
-  Augment
+  Augment,
+  DataProxyMode,
+  DataProxyTestResult
 } from '../shared/types'
 import type { CachedChampionBuild } from '../shared/types/opgg'
 
@@ -26,8 +29,8 @@ const electronAPI = {
       ipcRenderer.invoke('lcu:get-status'),
     reconnect: (): Promise<void> => 
       ipcRenderer.invoke('lcu:reconnect'),
-    onConnected: (callback: (data: { port: number; summoner: Summoner }) => void) => {
-      const handler = (_event: IpcRendererEvent, data: { port: number; summoner: Summoner }) => callback(data)
+    onConnected: (callback: (data: { port: number; summoner: Summoner | null }) => void) => {
+      const handler = (_event: IpcRendererEvent, data: { port: number; summoner: Summoner | null }) => callback(data)
       ipcRenderer.on('lcu:connected', handler)
       return () => ipcRenderer.removeListener('lcu:connected', handler)
     },
@@ -47,12 +50,19 @@ const electronAPI = {
   gameflow: {
     getPhase: (): Promise<GameFlowPhase> => 
       ipcRenderer.invoke('gameflow:get-phase'),
+    getMode: (): Promise<GameModeContext> =>
+      ipcRenderer.invoke('gameflow:get-mode'),
     reconnectGame: (): Promise<void> => 
       ipcRenderer.invoke('gameflow:reconnect'),
     onPhaseChanged: (callback: (data: { phase: GameFlowPhase; timestamp: number }) => void) => {
       const handler = (_event: IpcRendererEvent, data: { phase: GameFlowPhase; timestamp: number }) => callback(data)
       ipcRenderer.on('gameflow:phase-changed', handler)
       return () => ipcRenderer.removeListener('gameflow:phase-changed', handler)
+    },
+    onModeChanged: (callback: (data: GameModeContext) => void) => {
+      const handler = (_event: IpcRendererEvent, data: GameModeContext) => callback(data)
+      ipcRenderer.on('gameflow:mode-changed', handler)
+      return () => ipcRenderer.removeListener('gameflow:mode-changed', handler)
     },
   },
   
@@ -66,6 +76,10 @@ const electronAPI = {
       ipcRenderer.invoke('champselect:execute-ban', championId),
     dodge: (): Promise<boolean> => 
       ipcRenderer.invoke('champselect:dodge'),
+    reroll: (): Promise<{ success: boolean; message: string }> =>
+      ipcRenderer.invoke('champselect:reroll'),
+    swapBench: (championId: number): Promise<{ success: boolean; message: string }> =>
+      ipcRenderer.invoke('champselect:swap-bench', championId),
     onSessionUpdated: (callback: (session: ChampSelectSession) => void) => {
       const handler = (_event: IpcRendererEvent, session: ChampSelectSession) => callback(session)
       ipcRenderer.on('champselect:session-updated', handler)
@@ -111,10 +125,16 @@ const electronAPI = {
       ipcRenderer.invoke('data:get-items'),
     getAugments: (): Promise<Augment[]> => 
       ipcRenderer.invoke('data:get-augments'),
-    getTierList: (mode: string, tier: string): Promise<any> => 
-      ipcRenderer.invoke('data:get-tier-list', mode, tier),
-    getChampionBuild: (championId: number, position: string, mode?: string): Promise<CachedChampionBuild | null> => 
-      ipcRenderer.invoke('data:get-champion-build', championId, position, mode),
+    getTierList: (mode: string, tier: string, region?: string): Promise<any> =>
+      ipcRenderer.invoke('data:get-tier-list', mode, tier, region),
+    getChampionBuild: (
+      championId: number,
+      position: string,
+      mode?: string,
+      region?: string,
+      tier?: string
+    ): Promise<CachedChampionBuild | null> =>
+      ipcRenderer.invoke('data:get-champion-build', championId, position, mode, region, tier),
     getRunes: (): Promise<RunePage[]> => 
       ipcRenderer.invoke('data:get-runes'),
   },
@@ -139,6 +159,8 @@ const electronAPI = {
       ipcRenderer.invoke('settings:get'),
     set: (settings: Partial<AppSettings>): Promise<void> => 
       ipcRenderer.invoke('settings:set', settings),
+    testDataProxy: (mode: DataProxyMode, proxyUrl: string): Promise<DataProxyTestResult> =>
+      ipcRenderer.invoke('settings:test-data-proxy', mode, proxyUrl),
   },
   
   // 观战

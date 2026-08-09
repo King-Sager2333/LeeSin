@@ -17,12 +17,18 @@ export const useLCUStore = create<LCUState>((set) => ({
 // 游戏流状态
 interface GameFlowState {
   phase: GameFlowPhase
+  gameMode: string
+  queueId: number
   setPhase: (phase: GameFlowPhase) => void
+  setGameMode: (mode: string, queueId: number) => void
 }
 
 export const useGameFlowStore = create<GameFlowState>((set) => ({
   phase: 'None',
+  gameMode: 'ranked',
+  queueId: 0,
   setPhase: (phase) => set({ phase }),
+  setGameMode: (gameMode, queueId) => set({ gameMode, queueId }),
 }))
 
 // 英雄选择状态

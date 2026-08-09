@@ -7,6 +7,7 @@ import type { OPGGClient } from '../core/data/opgg-client'
 import type { StaticDataManager } from '../core/data/static-data'
 import { Dodge } from '../core/automation/dodge'
 import { Logger } from '../services/logger'
+import type { AppSettings, DataProxyMode } from '../../shared/types'
 
 interface ServiceProviders {
   getMainWindow: () => BrowserWindow | null
@@ -50,6 +51,14 @@ export function registerIPCHandlers(providers: ServiceProviders): void {
   ipcMain.handle('gameflow:get-phase', async () => {
     const monitor = getGameFlowMonitor()
     return monitor?.getCurrentPhase() || 'None'
+  })
+
+  ipcMain.handle('gameflow:get-mode', async () => {
+    const monitor = getGameFlowMonitor()
+    return {
+      mode: monitor?.getCurrentGameMode() || 'ranked',
+      queueId: monitor?.getCurrentQueueId() || 0,
+    }
   })
   
   ipcMain.handle('gameflow:reconnect', async () => {
@@ -137,6 +146,40 @@ export function registerIPCHandlers(providers: ServiceProviders): void {
     const result = await dodge.execute()
     return result.success
   })
+
+  ipcMain.handle('champselect:reroll', async () => {
+    const client = getLCUClient()
+    const session = getGameFlowMonitor()?.getCurrentSession()
+    if (!client || !session) return { success: false, message: '当前不在英雄选择阶段' }
+    if (!session.allowRerolling || session.rerollsRemaining <= 0) {
+      return { success: false, message: '当前没有可用的重随机次数' }
+    }
+
+    try {
+      await client.reroll()
+      return { success: true, message: '已重新随机英雄' }
+    } catch (error: any) {
+      Logger.error('Failed to reroll champion', error)
+      return { success: false, message: error.message || '重新随机失败' }
+    }
+  })
+
+  ipcMain.handle('champselect:swap-bench', async (_event, championId: number) => {
+    const client = getLCUClient()
+    const session = getGameFlowMonitor()?.getCurrentSession()
+    if (!client || !session) return { success: false, message: '当前不在英雄选择阶段' }
+    if (!session.benchEnabled || !session.benchChampions.some(champion => champion.championId === championId)) {
+      return { success: false, message: '该英雄已不在备战席' }
+    }
+
+    try {
+      await client.swapBenchChampion(championId)
+      return { success: true, message: '已交换备战席英雄' }
+    } catch (error: any) {
+      Logger.error('Failed to swap bench champion', error)
+      return { success: false, message: error.message || '交换英雄失败' }
+    }
+  })
   
   // === 自动化相关 ===
   ipcMain.handle('automation:toggle-auto-accept', async (_event, enabled: boolean) => {
@@ -211,8 +254,8 @@ export function registerIPCHandlers(providers: ServiceProviders): void {
     if (!lcu) return { success: false, message: '未连接客户端' }
     
     try {
-      await lcu.setMySelection(spell1Id, spell2Id)
-      return { success: true, message: '召唤师技能已应用' }
+      await lcu.applySummonerSpellsPreservingSlots(spell1Id, spell2Id)
+      return { success: true, message: '召唤师技能已应用，D/F 键位保持不变' }
     } catch (error: any) {
       Logger.error('Apply spells failed', error)
       return { success: false, message: error.message }
@@ -235,22 +278,29 @@ export function registerIPCHandlers(providers: ServiceProviders): void {
     return staticData?.getAllAugments() || []
   })
   
-  ipcMain.handle('data:get-tier-list', async (_event, mode: string, tier: string) => {
+  ipcMain.handle('data:get-tier-list', async (_event, mode: string, tier: string, regionOverride?: string) => {
     const opgg = getOPGGClient()
     const config = getConfigService()
-    const region = config?.get('region') || 'kr'
+    const region = regionOverride || config?.get('region') || 'kr'
     
     return opgg?.getTierList(mode, region, tier) || null
   })
   
-  ipcMain.handle('data:get-champion-build', async (_event, championId: number, position: string, mode?: string) => {
+  ipcMain.handle('data:get-champion-build', async (
+    _event,
+    championId: number,
+    position: string,
+    mode?: string,
+    regionOverride?: string,
+    tierOverride?: string
+  ) => {
     const opgg = getOPGGClient()
     const config = getConfigService()
     
     if (!opgg || !config) return null
     
-    const region = config.get('region')
-    const tier = config.get('tier')
+    const region = regionOverride || config.get('region')
+    const tier = tierOverride || config.get('tier')
     const gameMode = mode || config.get('gameMode') || 'ranked'
     
     return opgg.getChampionBuild(championId, position, region, tier, gameMode)
@@ -335,9 +385,30 @@ export function registerIPCHandlers(providers: ServiceProviders): void {
     return config?.getSettings() || null
   })
   
-  ipcMain.handle('settings:set', async (_event, settings: any) => {
+  ipcMain.handle('settings:set', async (_event, settings: Partial<AppSettings>) => {
     const config = getConfigService()
-    config?.setSettings(settings)
+    if (!config) return
+
+    const proxyChanged = Object.prototype.hasOwnProperty.call(settings, 'dataProxyMode')
+      || Object.prototype.hasOwnProperty.call(settings, 'dataProxyUrl')
+    if (proxyChanged) {
+      const current = config.getSettings()
+      const mode = settings.dataProxyMode || current.dataProxyMode || 'system'
+      const proxyUrl = settings.dataProxyUrl ?? current.dataProxyUrl ?? ''
+      await getOPGGClient()?.configureDataProxy(mode, proxyUrl)
+    }
+
+    config.setSettings(settings)
+  })
+
+  ipcMain.handle('settings:test-data-proxy', async (
+    _event,
+    mode: DataProxyMode,
+    proxyUrl: string
+  ) => {
+    const opgg = getOPGGClient()
+    if (!opgg) return { success: false, message: '数据服务尚未初始化' }
+    return opgg.testDataProxy(mode, proxyUrl)
   })
   
   // === 观战相关 ===

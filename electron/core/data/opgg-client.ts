@@ -1,7 +1,9 @@
-import axios, { AxiosInstance } from 'axios'
 import { LRUCache } from 'lru-cache'
 import { Logger } from '../../services/logger'
 import { OPGG_API } from '../../../shared/constants'
+import { AramMayhemClient } from './aram-mayhem-client'
+import { ElectronExternalDataTransport } from './external-data-transport'
+import type { DataProxyMode, DataProxyTestResult } from '../../../shared/types'
 import type { 
   OPGGChampionBuildResponse, 
   OPGGTierListResponse, 
@@ -17,19 +19,14 @@ interface AugmentData {
 }
 
 export class OPGGClient {
-  private client: AxiosInstance
+  private externalData: ElectronExternalDataTransport
   private cache: LRUCache<string, any>
   private augmentsCache: Map<number, AugmentData> = new Map()
+  private aramMayhemClient: AramMayhemClient
   
-  constructor() {
-    this.client = axios.create({
-      baseURL: OPGG_API.BASE_URL,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/json',
-      },
-      timeout: 15000,
-    })
+  constructor(proxyMode: DataProxyMode = 'system', proxyUrl: string = '') {
+    this.externalData = new ElectronExternalDataTransport(proxyMode, proxyUrl)
+    this.aramMayhemClient = new AramMayhemClient(this.externalData)
     
     // LRU cache, 500 entries max, 1 hour TTL
     this.cache = new LRUCache<string, any>({
@@ -44,11 +41,11 @@ export class OPGGClient {
   // 加载增幅符文数据 (使用中文版本)
   private async loadAugmentsData(): Promise<void> {
     try {
-      const response = await axios.get<AugmentData[]>(
+      const response = await this.externalData.getJson<AugmentData[]>(
         'https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/zh_cn/v1/cherry-augments.json'
       )
       
-      for (const aug of response.data) {
+      for (const aug of response) {
         this.augmentsCache.set(aug.id, aug)
       }
       
@@ -95,14 +92,44 @@ export class OPGGClient {
     if (cached) {
       return cached
     }
+
+    if (mode === 'aram-mayhem') {
+      const nativeResult = await this.aramMayhemClient.getTierList()
+      if (nativeResult) {
+        this.cache.set(cacheKey, nativeResult)
+        return nativeResult
+      }
+
+      Logger.warn('Dedicated ARAM Mayhem tier list unavailable; using explicitly labelled ARAM rankings')
+      try {
+        const fallbackUrl = OPGG_API.TIER_LIST(region, 'aram', tier)
+        const fallbackResponse = await this.getOPGG<OPGGTierListResponse>(fallbackUrl)
+        const fallbackResult: OPGGTierListResponse = {
+          ...fallbackResponse,
+          meta: {
+            ...fallbackResponse.meta,
+            dataSource: {
+              kind: 'fallback',
+              label: '普通大乱斗英雄排行',
+              details: '海克斯大乱斗专属排行源暂时不可用；仅排行临时降级，英雄出装不会使用普通大乱斗数据',
+            },
+          },
+        }
+        this.cache.set(cacheKey, fallbackResult)
+        return fallbackResult
+      } catch (error: any) {
+        Logger.error('Failed to get ARAM fallback tier list', error.message)
+        return null
+      }
+    }
     
     try {
       const url = OPGG_API.TIER_LIST(region, mode, tier)
-      const response = await this.client.get<OPGGTierListResponse>(url)
+      const response = await this.getOPGG<OPGGTierListResponse>(url)
       
-      this.cache.set(cacheKey, response.data)
+      this.cache.set(cacheKey, response)
       
-      return response.data
+      return response
     } catch (error: any) {
       Logger.error('Failed to get OP.GG tier list', error.message)
       return null
@@ -128,43 +155,26 @@ export class OPGGClient {
       await this.ensureAugmentsLoaded()
     }
     
-    // For ARAM Mayhem: 装备使用ARAM数据，增幅符文使用Arena数据
+    // ARAM Mayhem uses dedicated, current-mode sources only. Ordinary ARAM and
+    // Arena builds are materially different and must never be presented as Mayhem data.
     if (mode === 'aram-mayhem') {
-      try {
-        // 1. 获取ARAM装备数据
-        const aramUrl = OPGG_API.CHAMPION_BUILD(region, 'aram', championId, 'none', tier)
-        const aramResponse = await this.client.get<OPGGChampionBuildResponse>(aramUrl)
-        const aramBuild = this.parseNormalBuild(aramResponse.data, championId, 'none')
-        
-        // 2. 获取Arena增幅符文数据
-        const arenaUrl = OPGG_API.ARENA_BUILD(region, championId, 'all')
-        const arenaResponse = await this.client.get<OPGGChampionBuildResponse>(arenaUrl)
-        const arenaBuild = this.parseArenaBuild(arenaResponse.data, championId)
-        
-        if (aramBuild) {
-          // 合并: 装备用ARAM的，增幅符文用Arena的
-          const combinedBuild: CachedChampionBuild = {
-            ...aramBuild,
-            mode: 'aram-mayhem',
-            position: 'none',
-            // 增幅符文从Arena获取
-            augments: arenaBuild?.augments || [],
-            // 符文大乱斗不需要协同英雄
-            synergies: undefined,
-            // 不需要符文和召唤师技能（符文大乱斗有特殊机制）
-            runes: [],
-            spells: [],
-          }
-          
-          combinedBuild.version = aramResponse.data.meta?.version || ''
-          this.cache.set(cacheKey, combinedBuild)
-          return combinedBuild
-        }
-      } catch (error: any) {
-        Logger.error(`Failed to get ARAM Mayhem build: ${championId}`, error.message)
+      const dedicatedBuild = await this.aramMayhemClient.getChampionBuild(championId)
+      if (!dedicatedBuild) {
+        Logger.error(`No current dedicated ARAM Mayhem build is available for champion ${championId}`)
+        return null
       }
-      
-      return null
+
+      dedicatedBuild.augments = dedicatedBuild.augments?.map(augment => {
+        const localInfo = this.getAugmentInfo(augment.id)
+        return {
+          ...augment,
+          name: localInfo?.name || augment.name,
+          iconUrl: localInfo?.iconUrl || augment.iconUrl,
+          rarity: localInfo?.rarity || augment.rarity,
+        }
+      })
+      this.cache.set(cacheKey, dedicatedBuild)
+      return dedicatedBuild
     }
     
     try {
@@ -180,24 +190,24 @@ export class OPGGClient {
       }
       
       Logger.debug(`Fetching OP.GG build: ${url}`)
-      const response = await this.client.get<OPGGChampionBuildResponse>(url)
+      const response = await this.getOPGG<OPGGChampionBuildResponse>(url)
       
       // 添加更详细的日志
       if (championId === 89) { // Leona
-        Logger.debug(`Leona response data: ${JSON.stringify(response.data, null, 2)}`)
+        Logger.debug(`Leona response data: ${JSON.stringify(response, null, 2)}`)
       }
       
       // Parse based on mode
       let build: CachedChampionBuild | null
       if (mode === 'arena') {
-        build = this.parseArenaBuild(response.data, championId)
+        build = this.parseArenaBuild(response, championId)
       } else {
-        build = this.parseNormalBuild(response.data, championId, position)
+        build = this.parseNormalBuild(response, championId, position)
       }
       
       if (build) {
         build.mode = mode
-        build.version = response.data.meta?.version || ''
+        build.version = response.meta?.version || ''
         this.cache.set(cacheKey, build)
       }
       
@@ -391,7 +401,33 @@ export class OPGGClient {
       last: lastData.slice(0, 16).map(i => i.ids[0]),
     }
     
-    // Get augments - 包含名称、图标和稀有度，扁平化所有轮次
+    const augments = this.parseAugments(data)
+
+    // Get synergies
+    const synergiesData = data.synergies || []
+    const synergies = synergiesData.slice(0, 10).map(s => ({
+      championId: s.champion_id,
+      winRate: s.play > 0 ? s.win / s.play : 0,
+      averagePlace: s.play > 0 ? s.total_place / s.play : 4,
+    }))
+
+    return {
+      championId,
+      position: 'none',
+      mode: 'arena',
+      version: '',
+      timestamp: Date.now(),
+      summary,
+      runes: [],  // Arena doesn't have runes
+      spells: [],  // Arena doesn't have spells selection
+      skills,
+      items,
+      augments,
+      synergies,
+    }
+  }
+
+  private parseAugments(data: OPGGChampionBuildResponse['data']): NonNullable<CachedChampionBuild['augments']> {
     const augmentGroups = data.augment_group || []
     const allAugments: any[] = []
     
@@ -411,38 +447,15 @@ export class OPGGClient {
     
     // 按选取率排序并去重
     const seenIds = new Set<number>()
-    const augments = allAugments
+    return allAugments
       .filter(aug => {
         if (seenIds.has(aug.id)) return false
         seenIds.add(aug.id)
         return true
       })
       .sort((a, b) => b.pickRate - a.pickRate)
-    
-    // Get synergies
-    const synergiesData = data.synergies || []
-    const synergies = synergiesData.slice(0, 10).map(s => ({
-      championId: s.champion_id,
-      winRate: s.play > 0 ? s.win / s.play : 0,
-      averagePlace: s.play > 0 ? s.total_place / s.play : 4,
-    }))
-    
-    return {
-      championId,
-      position: 'none',
-      mode: 'arena',
-      version: '',
-      timestamp: Date.now(),
-      summary,
-      runes: [],  // Arena doesn't have runes
-      spells: [],  // Arena doesn't have spells selection
-      skills,
-      items,
-      augments,
-      synergies,
-    }
   }
-  
+
   async getChampionPositions(
     championId: number,
     region: string = 'kr',
@@ -462,5 +475,18 @@ export class OPGGClient {
   
   clearCache(): void {
     this.cache.clear()
+  }
+
+  async configureDataProxy(mode: DataProxyMode, proxyUrl: string): Promise<void> {
+    await this.externalData.configure(mode, proxyUrl)
+    this.clearCache()
+  }
+
+  async testDataProxy(mode: DataProxyMode, proxyUrl: string): Promise<DataProxyTestResult> {
+    return ElectronExternalDataTransport.test(mode, proxyUrl)
+  }
+
+  private getOPGG<T>(path: string): Promise<T> {
+    return this.externalData.getJson<T>(new URL(path, OPGG_API.BASE_URL).toString())
   }
 }

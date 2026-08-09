@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events'
-import { exec, execSync } from 'child_process'
+import { execFile, execFileSync } from 'child_process'
+import { request as httpsRequest } from 'https'
 import { promisify } from 'util'
 import { readFile } from 'fs/promises'
 import { existsSync, readdirSync } from 'fs'
@@ -7,13 +8,21 @@ import { join } from 'path'
 import { Logger } from '../../services/logger'
 import type { LCUCredentials } from '../../../shared/types'
 
-const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
+const LCU_HEALTH_ENDPOINTS = [
+  '/riotclient/ux-state',
+  '/lol-gameflow/v1/gameflow-phase',
+] as const
 
 export class LCUConnector extends EventEmitter {
   private pollingInterval: NodeJS.Timeout | null = null
   private currentCredentials: LCUCredentials | null = null
   private isConnected = false
+  private isPolling = false
+  private consecutiveHealthCheckFailures = 0
   private readonly POLL_INTERVAL = 2000 // 2秒轮询
+  private readonly HEALTH_CHECK_TIMEOUT = 1500
+  private readonly MAX_HEALTH_CHECK_FAILURES = 3
   private installPath: string | null = null
   private tasklistPath: string | null = null
   
@@ -24,10 +33,15 @@ export class LCUConnector extends EventEmitter {
   
   private findTasklistPath(): void {
     // 查找tasklist可执行文件路径
-    const paths = ['tasklist', 'C:\\Windows\\System32\\tasklist.exe']
+    const systemRoot = process.env.SystemRoot || 'C:\\Windows'
+    const paths = ['tasklist.exe', join(systemRoot, 'System32', 'tasklist.exe')]
     for (const p of paths) {
       try {
-        execSync(`${p} /? >nul 2>&1`, { windowsHide: true })
+        execFileSync(p, ['/?'], {
+          windowsHide: true,
+          timeout: 3000,
+          stdio: 'ignore',
+        })
         this.tasklistPath = p
         Logger.debug(`Found tasklist: ${p}`)
         break
@@ -38,9 +52,11 @@ export class LCUConnector extends EventEmitter {
   }
   
   start(): void {
+    if (this.pollingInterval) return
+
     Logger.info('Starting LCU connector...')
-    this.poll()
-    this.pollingInterval = setInterval(() => this.poll(), this.POLL_INTERVAL)
+    void this.poll()
+    this.pollingInterval = setInterval(() => void this.poll(), this.POLL_INTERVAL)
   }
   
   stop(): void {
@@ -50,16 +66,30 @@ export class LCUConnector extends EventEmitter {
     }
     this.isConnected = false
     this.currentCredentials = null
+    this.consecutiveHealthCheckFailures = 0
   }
   
   private async poll(): Promise<void> {
+    if (this.isPolling) return
+    this.isPolling = true
+
     try {
       // Skip if already connected - just verify connection is still alive
       if (this.isConnected && this.currentCredentials) {
         const stillAlive = await this.verifyConnection()
-        if (!stillAlive) {
+        if (stillAlive) {
+          this.consecutiveHealthCheckFailures = 0
+        } else {
+          this.consecutiveHealthCheckFailures += 1
+          Logger.debug(
+            `LCU health check failed (${this.consecutiveHealthCheckFailures}/${this.MAX_HEALTH_CHECK_FAILURES})`
+          )
+        }
+
+        if (this.consecutiveHealthCheckFailures >= this.MAX_HEALTH_CHECK_FAILURES) {
           this.isConnected = false
           this.currentCredentials = null
+          this.consecutiveHealthCheckFailures = 0
           Logger.info('LCU disconnected')
           this.emit('disconnected')
         }
@@ -68,44 +98,99 @@ export class LCUConnector extends EventEmitter {
       
       const credentials = await this.findLCUCredentials()
       
-      if (credentials && !this.isConnected) {
+      if (credentials && !this.isConnected && await this.verifyCredentials(credentials)) {
         this.currentCredentials = credentials
         this.isConnected = true
+        this.consecutiveHealthCheckFailures = 0
         Logger.info(`LCU connected: port=${credentials.port}, pid=${credentials.pid}`)
         this.emit('connected', credentials)
+      } else if (credentials) {
+        // lockfile 和日志在客户端异常退出后可能残留。只有经过本地 API
+        // 认证的凭据才能触发 connected，避免连接/断开状态反复抖动。
+        Logger.debug(`Ignoring stale LCU credentials: port=${credentials.port}, pid=${credentials.pid}`)
       }
     } catch (error: any) {
-      // Silent - don't spam logs
+      Logger.debug('LCU polling failed', error?.message || error)
+    } finally {
+      this.isPolling = false
     }
   }
   
   private async verifyConnection(): Promise<boolean> {
-    // Check if the LeagueClientUx process is still running
-    const pid = await this.getLolClientPid()
-    return pid > 0
+    return this.currentCredentials
+      ? this.verifyCredentials(this.currentCredentials)
+      : false
+  }
+
+  private async verifyCredentials(credentials: LCUCredentials): Promise<boolean> {
+    // riotclient endpoint is available earliest during startup; gameflow is a
+    // compatibility fallback for regional clients with a different plugin set.
+    for (const endpoint of LCU_HEALTH_ENDPOINTS) {
+      if (await this.probeEndpoint(credentials, endpoint)) return true
+    }
+    return false
+  }
+
+  private async probeEndpoint(credentials: LCUCredentials, endpoint: string): Promise<boolean> {
+    return new Promise(resolve => {
+      let settled = false
+      const finish = (reachable: boolean) => {
+        if (settled) return
+        settled = true
+        resolve(reachable)
+      }
+
+      const request = httpsRequest({
+        hostname: '127.0.0.1',
+        port: credentials.port,
+        path: endpoint,
+        method: 'GET',
+        headers: {
+          Authorization: `Basic ${Buffer.from(`riot:${credentials.token}`).toString('base64')}`,
+          Accept: 'application/json',
+          Connection: 'close',
+        },
+        rejectUnauthorized: false,
+        agent: false,
+        timeout: this.HEALTH_CHECK_TIMEOUT,
+      }, response => {
+        response.resume()
+        finish(
+          response.statusCode !== undefined
+          && response.statusCode >= 200
+          && response.statusCode < 300
+        )
+      })
+
+      request.on('timeout', () => {
+        finish(false)
+        request.destroy()
+      })
+      request.on('error', () => finish(false))
+      request.end()
+    })
   }
   
   private async findLCUCredentials(): Promise<LCUCredentials | null> {
-    // 方法1: 使用tasklist获取PID，再用wmic获取命令行
+    // 方法1: 使用tasklist获取PID，再从进程命令行获取凭据
     const pid = await this.getLolClientPid()
     if (pid > 0) {
-      // 尝试通过wmic获取命令行参数
-      const credentialsFromWmic = await this.getCredentialsByPid(pid)
-      if (credentialsFromWmic) {
-        return credentialsFromWmic
+      const credentialsFromProcess = await this.getCredentialsByPid(pid)
+      if (credentialsFromProcess) {
+        return credentialsFromProcess
       }
     }
     
-    // 方法2: 从日志文件获取 (权限不足时的备选方案)
-    const credentialsFromLog = await this.getCredentialsFromLogFile()
-    if (credentialsFromLog) {
-      return credentialsFromLog
-    }
-    
-    // 方法3: 从lockfile获取
+    // 方法2: 从lockfile获取
     const credentialsFromLockfile = await this.getCredentialsFromLockfile()
     if (credentialsFromLockfile) {
       return credentialsFromLockfile
+    }
+
+    // 方法3: 从日志文件获取（客户端以管理员权限运行时的可靠备选方案）
+    const credentialsFromLog = await this.getCredentialsFromLogFile()
+    if (credentialsFromLog) {
+      return credentialsFromLog
     }
     
     return null
@@ -117,16 +202,18 @@ export class LCUConnector extends EventEmitter {
     }
     
     try {
-      const { stdout } = await execAsync(
-        `${this.tasklistPath} /FI "imagename eq LeagueClientUx.exe" /NH`,
+      const { stdout } = await execFileAsync(
+        this.tasklistPath,
+        ['/FI', 'IMAGENAME eq LeagueClientUx.exe', '/FO', 'CSV', '/NH'],
         { encoding: 'utf8', windowsHide: true, timeout: 5000 }
       )
-      
-      if (stdout.includes('LeagueClientUx.exe')) {
-        const match = stdout.match(/LeagueClientUx\.exe\s+(\d+)/)
-        if (match) {
-          return parseInt(match[1], 10)
-        }
+
+      const output = this.normalizeCommandOutput(stdout)
+      const csvMatch = output.match(/^\s*"LeagueClientUx\.exe","(\d+)"/im)
+      const tableMatch = output.match(/LeagueClientUx\.exe\s+(\d+)/i)
+      const match = csvMatch || tableMatch
+      if (match) {
+        return parseInt(match[1], 10)
       }
       
       return 0
@@ -137,11 +224,17 @@ export class LCUConnector extends EventEmitter {
   
   private getLolClientPidSlowly(): number {
     try {
-      const result = execSync(
-        'powershell -Command "(Get-Process LeagueClientUx -ErrorAction SilentlyContinue | Select-Object -First 1).Id"',
+      const result = execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          '(Get-Process -Name "LeagueClientUx" -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Id)',
+        ],
         { encoding: 'utf8', windowsHide: true, timeout: 5000 }
       )
-      const pid = parseInt(result.trim(), 10)
+      const pid = parseInt(this.normalizeCommandOutput(result).trim(), 10)
       return isNaN(pid) ? 0 : pid
     } catch {
       return 0
@@ -150,56 +243,66 @@ export class LCUConnector extends EventEmitter {
   
   private async getCredentialsByPid(pid: number): Promise<LCUCredentials | null> {
     try {
-      const { stdout } = await execAsync(
-        `wmic process where "ProcessId=${pid}" get CommandLine /format:list`,
+      const { stdout } = await execFileAsync(
+        'wmic.exe',
+        ['process', 'where', `ProcessId=${pid}`, 'get', 'CommandLine', '/format:list'],
         { encoding: 'utf8', windowsHide: true, timeout: 5000 }
       )
-      
-      if (stdout.includes('--app-port=')) {
-        const portMatch = stdout.match(/--app-port=(\d+)/)
-        const tokenMatch = stdout.match(/--remoting-auth-token=([\w_-]+)/)
-        
-        if (portMatch && tokenMatch) {
-          const port = parseInt(portMatch[1], 10)
-          const token = tokenMatch[1]
-          
-          Logger.info(`Got LCU credentials via wmic: port=${port}`)
-          return { port, token, pid }
-        }
+
+      const credentials = this.parseCommandLineCredentials(stdout, pid, 'wmic')
+      if (credentials) {
+        return credentials
       }
-      
-      return null
-    } catch (error: any) {
-      // wmic may not be available, try PowerShell silently
-      return this.getCredentialsByPidViaPowerShell(pid)
+    } catch {
+      // 新版Windows可能未安装WMIC，继续尝试PowerShell
     }
+
+    // WMIC存在但因权限返回空命令行时也必须继续尝试PowerShell
+    return this.getCredentialsByPidViaPowerShell(pid)
   }
   
   private async getCredentialsByPidViaPowerShell(pid: number): Promise<LCUCredentials | null> {
     try {
-      const { stdout } = await execAsync(
-        `powershell -Command "(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`,
+      const { stdout } = await execFileAsync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); (Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+        ],
         { encoding: 'utf8', windowsHide: true, timeout: 5000 }
       )
-      
-      if (stdout.includes('--app-port=')) {
-        const portMatch = stdout.match(/--app-port=(\d+)/)
-        const tokenMatch = stdout.match(/--remoting-auth-token=([\w_-]+)/)
-        
-        if (portMatch && tokenMatch) {
-          const port = parseInt(portMatch[1], 10)
-          const token = tokenMatch[1]
-          
-          Logger.info(`Got LCU credentials via PowerShell: port=${port}`)
-          return { port, token, pid }
-        }
-      }
-      
-      return null
-    } catch (error: any) {
-      // Silent - will try other methods
+
+      return this.parseCommandLineCredentials(stdout, pid, 'PowerShell')
+    } catch {
       return null
     }
+  }
+
+  private normalizeCommandOutput(output: string | Buffer): string {
+    return String(output).replace(/^\uFEFF/, '').replace(/\0/g, '')
+  }
+
+  private parseCommandLineCredentials(
+    output: string | Buffer,
+    pid: number,
+    source: string
+  ): LCUCredentials | null {
+    const commandLine = this.normalizeCommandOutput(output)
+    const portMatch = commandLine.match(/(?:^|\s)["']?--app-port(?:=|\s+)["']?(\d+)/i)
+    const tokenMatch = commandLine.match(
+      /(?:^|\s)["']?--remoting-auth-token(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s"']+))/i
+    )
+
+    if (!portMatch || !tokenMatch) return null
+
+    const port = parseInt(portMatch[1], 10)
+    const token = tokenMatch[1] || tokenMatch[2] || tokenMatch[3]
+    if (!Number.isInteger(port) || port <= 0 || !token) return null
+
+    Logger.info(`Got LCU credentials via ${source}: port=${port}`)
+    return { port, token, pid }
   }
   
   /**
@@ -225,18 +328,10 @@ export class LCUConnector extends EventEmitter {
       const content = await readFile(latestLog, 'utf8')
       const lines = content.split('\n').slice(0, 20).join('\n')
       
-      const portMatch = lines.match(/--app-port=(\d+)/)
-      const tokenMatch = lines.match(/--remoting-auth-token=([\w_-]+)/)
       const pidMatch = uxLogFiles[0].match(/_(\d+)_LeagueClientUx/)
-      
-      if (portMatch && tokenMatch) {
-        const port = parseInt(portMatch[1], 10)
-        const token = tokenMatch[1]
-        const pid = pidMatch ? parseInt(pidMatch[1], 10) : 0
-        
-        Logger.info(`Got LCU credentials via log file: port=${port}`)
-        return { port, token, pid }
-      }
+      const pid = pidMatch ? parseInt(pidMatch[1], 10) : 0
+
+      return this.parseCommandLineCredentials(lines, pid, 'log file')
     } catch (error: any) {
       // Silent
     }
@@ -331,18 +426,25 @@ export class LCUConnector extends EventEmitter {
    */
   private getLoLPathFromRegistry(): string | null {
     try {
-      const result = execSync(
-        'reg query "HKEY_CURRENT_USER\\SOFTWARE\\Tencent\\LOL" /v InstallPath 2>nul',
+      // reg.exe使用系统代码页输出，中文安装路径按UTF-8读取会乱码；
+      // PowerShell显式使用UTF-8，保证国服的中文路径可以被Node正确解析。
+      const result = execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); (Get-ItemProperty -LiteralPath "HKCU:\\SOFTWARE\\Tencent\\LOL" -ErrorAction Stop).InstallPath',
+        ],
         { encoding: 'utf8', windowsHide: true, timeout: 3000 }
       )
-      
-      const match = result.match(/InstallPath\s+REG_SZ\s+(.+)/)
-      if (match) {
-        const installPath = match[1].trim()
+
+      const installPath = this.normalizeCommandOutput(result).trim()
+      if (installPath) {
         const gamePath = installPath.replace(/[/\\]TCLS$/i, '')
         return gamePath
       }
-    } catch (error) {
+    } catch {
       // Silent
     }
     

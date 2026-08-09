@@ -4,6 +4,22 @@ import { Logger } from '../../services/logger'
 import { LCU_ENDPOINTS } from '../../../shared/constants'
 import type { Summoner, GameFlowPhase, ChampSelectSession, RunePage, Champion, SummonerSpell, Perk, PerkStyle } from '../../../shared/types'
 
+export function preserveSummonerSpellSlots(
+  currentD: number,
+  currentF: number,
+  recommendedFirst: number,
+  recommendedSecond: number
+): [number, number] {
+  // If either recommended spell is already bound, keep that spell on its
+  // current key and only replace the other slot.
+  if (currentD === recommendedFirst) return [recommendedFirst, recommendedSecond]
+  if (currentD === recommendedSecond) return [recommendedSecond, recommendedFirst]
+  if (currentF === recommendedFirst) return [recommendedSecond, recommendedFirst]
+  if (currentF === recommendedSecond) return [recommendedFirst, recommendedSecond]
+
+  return [recommendedFirst, recommendedSecond]
+}
+
 export class LCUClient {
   private client: AxiosInstance
   private port: number
@@ -24,6 +40,8 @@ export class LCUClient {
       httpsAgent: new https.Agent({
         rejectUnauthorized: false, // 忽略自签名证书
       }),
+      // LCU只监听本机回环地址，不能受系统HTTP(S)代理影响
+      proxy: false,
       timeout: 10000,
     })
     
@@ -122,6 +140,41 @@ export class LCUClient {
     if (spell2Id !== undefined) data.spell2Id = spell2Id
     if (skinId !== undefined) data.selectedSkinId = skinId
     await this.patch(LCU_ENDPOINTS.CHAMP_SELECT_MY_SELECTION, data)
+  }
+
+  async applySummonerSpellsPreservingSlots(
+    recommendedFirst: number,
+    recommendedSecond: number
+  ): Promise<[number, number]> {
+    let currentD = 0
+    let currentF = 0
+
+    try {
+      const session = await this.getChampSelectSession()
+      const localPlayer = session.myTeam?.find(
+        player => player.cellId === session.localPlayerCellId
+      )
+      currentD = localPlayer?.spell1Id || 0
+      currentF = localPlayer?.spell2Id || 0
+    } catch (error) {
+      // Reading the current selection is best-effort. If it is unavailable,
+      // retain the recommendation order instead of blocking spell application.
+      Logger.warn('Unable to read current D/F spell slots; using recommendation order')
+    }
+
+    const [spellOnD, spellOnF] = preserveSummonerSpellSlots(
+      currentD,
+      currentF,
+      recommendedFirst,
+      recommendedSecond
+    )
+
+    if (spellOnD !== currentD || spellOnF !== currentF) {
+      await this.setMySelection(spellOnD, spellOnF)
+    }
+
+    Logger.info(`Summoner spells applied without swapping D/F: D=${spellOnD}, F=${spellOnF}`)
+    return [spellOnD, spellOnF]
   }
   
   async reroll(): Promise<void> {

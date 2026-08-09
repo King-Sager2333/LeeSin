@@ -1,9 +1,9 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Search, Sparkles, Shield, Swords, Users, ArrowLeft, Crown, Database, Check } from 'lucide-react'
 import { useLCUStore, useDataStore, useSettingsStore, useGameFlowStore, useNotificationStore, useBuildPageStore } from '../../store'
 import { useLocation, useNavigate } from 'react-router-dom'
-import type { CachedChampionBuild } from '../../../shared/types/opgg'
+import type { CachedChampionBuild, RecommendationDataSource } from '../../../shared/types/opgg'
 
 interface TierChampion {
   id: number
@@ -31,11 +31,13 @@ const MODES = [
   { id: 'aram-mayhem', label: '符文大乱斗' },
 ]
 
+const MODE_IDS = new Set(MODES.map(mode => mode.id))
+
 export default function Build() {
   const { connected } = useLCUStore()
   const { champions } = useDataStore()
   const { settings } = useSettingsStore()
-  const { phase } = useGameFlowStore()
+  const { phase, gameMode } = useGameFlowStore()
   const { addNotification } = useNotificationStore()
   const { selectedChampionId: storedChampionId, selectedMode: storedMode, setSelectedChampionId, setSelectedMode: setStoredMode } = useBuildPageStore()
   const location = useLocation()
@@ -45,6 +47,8 @@ export default function Build() {
   const searchParams = new URLSearchParams(location.search)
   const initialChampionId = searchParams.get('championId')
   const initialPosition = searchParams.get('position') || 'mid'
+  const requestedMode = searchParams.get('mode')
+  const initialMode = requestedMode && MODE_IDS.has(requestedMode) ? requestedMode : storedMode || 'ranked'
 
   // 初始化：优先使用 URL 参数，其次使用 store 中保存的状态
   const [searchQuery, setSearchQuery] = useState('')
@@ -52,7 +56,7 @@ export default function Build() {
     initialChampionId ? parseInt(initialChampionId) : storedChampionId
   )
   const [selectedPosition, setSelectedPosition] = useState(initialPosition)
-  const [selectedMode, setSelectedModeLocal] = useState(storedMode || 'ranked')
+  const [selectedMode, setSelectedModeLocal] = useState(initialMode)
   const [build, setBuild] = useState<CachedChampionBuild | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [showChampionList, setShowChampionList] = useState(false)
@@ -64,15 +68,35 @@ export default function Build() {
   const [applyingRunes, setApplyingRunes] = useState(false)
   const [applyingSpells, setApplyingSpells] = useState(false)
   const [actualPosition, setActualPosition] = useState<string | null>(null)  // 实际加载的分路（可能和 selectedPosition 不同）
+  const [tierDataSource, setTierDataSource] = useState<RecommendationDataSource | null>(null)
+  const tierRequestId = useRef(0)
+  const buildRequestId = useRef(0)
 
   // 封装 setSelectedChampion，同时更新 store
   const setSelectedChampion = (id: number | null) => {
+    buildRequestId.current += 1
+    if (id !== null) {
+      tierRequestId.current += 1
+    }
     setSelectedChampionLocal(id)
     setSelectedChampionId(id)
   }
 
   // 封装 setSelectedMode，同时更新 store
   const setSelectedMode = (mode: string) => {
+    if (mode === selectedMode) {
+      setStoredMode(mode)
+      return
+    }
+    tierRequestId.current += 1
+    buildRequestId.current += 1
+    if (selectedChampion) {
+      setBuild(null)
+      setIsLoading(true)
+    } else {
+      setTierDataSource(null)
+      setTierLoading(true)
+    }
     setSelectedModeLocal(mode)
     setStoredMode(mode)
   }
@@ -90,6 +114,7 @@ export default function Build() {
     const searchParams = new URLSearchParams(location.search)
     const championId = searchParams.get('championId')
     const position = searchParams.get('position')
+    const mode = searchParams.get('mode')
 
     if (championId) {
       const parsedId = parseInt(championId)
@@ -97,17 +122,24 @@ export default function Build() {
         setSelectedChampion(parsedId)
         setShowChampionList(false)
         setSearchQuery('')
-        // 从URL跳转时手动加载build数据
-        if (connected) {
-          setTimeout(() => loadBuild(), 50)
-        }
       }
     }
 
     if (position) {
       setSelectedPosition(position)
     }
+
+    if (mode && MODE_IDS.has(mode)) {
+      setSelectedMode(mode)
+    }
   }, [location.search])
+
+  // 英雄选择阶段始终优先跟随客户端实际模式；用户之后仍可手动切换查看其他模式。
+  useEffect(() => {
+    if (phase === 'ChampSelect' && MODE_IDS.has(gameMode)) {
+      setSelectedMode(gameMode)
+    }
+  }, [phase, gameMode])
 
   // Filter champions based on search
   const filteredChampions = champions.filter(c => 
@@ -145,19 +177,23 @@ export default function Build() {
     if (connected && !selectedChampion) {
       loadTierList()
     }
-  }, [selectedMode, connected, selectedChampion, tier])
+  }, [selectedMode, connected, selectedChampion, tier, region])
 
   // Load build when champion changes
   useEffect(() => {
     if (selectedChampion && connected) {
       loadBuild()
     }
-  }, [selectedChampion, selectedMode, tier])
+  }, [selectedChampion, selectedMode, tier, region])
 
   const loadTierList = async () => {
+    const requestId = ++tierRequestId.current
     setTierLoading(true)
+    setTierDataSource(null)
     try {
-      const result = await window.electronAPI.data.getTierList(selectedMode, tier)
+      const result = await window.electronAPI.data.getTierList(selectedMode, tier, region)
+      if (requestId !== tierRequestId.current) return
+      setTierDataSource(result?.meta?.dataSource || null)
       if (result?.data) {
         // 保存完整的原始数据到 allTierData（用于后续查询英雄可用分路）
         setAllTierData(result.data)
@@ -200,9 +236,13 @@ export default function Build() {
         setTierList(parsed)
       }
     } catch (error) {
-      console.error('Failed to load tier list', error)
+      if (requestId === tierRequestId.current) {
+        console.error('Failed to load tier list', error)
+      }
     } finally {
-      setTierLoading(false)
+      if (requestId === tierRequestId.current) {
+        setTierLoading(false)
+      }
     }
   }
 
@@ -248,10 +288,10 @@ export default function Build() {
   const loadBuild = async () => {
     if (!selectedChampion) return
 
+    const requestId = ++buildRequestId.current
     setIsLoading(true)
     try {
-      // Arena and ARAM Mayhem don't need position
-      const needsPosition = selectedMode !== 'arena' && selectedMode !== 'aram-mayhem'
+      const needsPosition = selectedMode === 'ranked'
 
       // 自动使用英雄的最佳分路（按胜率排序的第一个）
       let positionToLoad = 'none'
@@ -274,8 +314,11 @@ export default function Build() {
       const result = await window.electronAPI.data.getChampionBuild(
         selectedChampion,
         positionToLoad,
-        selectedMode
+        selectedMode,
+        region,
+        tier
       )
+      if (requestId !== buildRequestId.current) return
 
       // 如果返回 null，尝试其他位置作为备选
       if (!result && needsPosition) {
@@ -290,8 +333,11 @@ export default function Build() {
           const fallbackResult = await window.electronAPI.data.getChampionBuild(
             selectedChampion,
             fallbackPos,
-            selectedMode
+            selectedMode,
+            region,
+            tier
           )
+          if (requestId !== buildRequestId.current) return
 
           if (fallbackResult) {
             console.log(`Found build data in fallback position: ${fallbackPos}`)
@@ -305,9 +351,13 @@ export default function Build() {
 
       setBuild(result)
     } catch (error) {
-      console.error('Failed to load build', error)
+      if (requestId === buildRequestId.current) {
+        console.error('Failed to load build', error)
+      }
     } finally {
-      setIsLoading(false)
+      if (requestId === buildRequestId.current) {
+        setIsLoading(false)
+      }
     }
   }
 
@@ -347,6 +397,13 @@ export default function Build() {
     navigate(`${location.pathname}?${params.toString()}`, { replace: true })
   }
 
+  const selectMode = (mode: string) => {
+    setSelectedMode(mode)
+    const params = new URLSearchParams(location.search)
+    params.set('mode', mode)
+    navigate(`${location.pathname}?${params.toString()}`, { replace: true })
+  }
+
   const getChampionName = (id: number): string => {
     return champions.find(c => c.id === id)?.name || `Champion ${id}`
   }
@@ -355,6 +412,18 @@ export default function Build() {
     if (!value) return '0%'
     return `${(value * 100).toFixed(1)}%`
   }
+
+  const getSkillColor = (skill: string): string => {
+    const colors: Record<string, string> = {
+      Q: 'bg-blue-500/20 border-blue-500/40 text-blue-300',
+      W: 'bg-green-500/20 border-green-500/40 text-green-300',
+      E: 'bg-yellow-500/20 border-yellow-500/40 text-yellow-300',
+      R: 'bg-purple-500/20 border-purple-500/40 text-purple-300',
+    }
+    return colors[skill.toUpperCase()] || 'bg-lol-bg-secondary border-lol-border text-lol-text-secondary'
+  }
+
+  const showTierAveragePlace = selectedMode === 'arena' || tierList.some(champion => champion.averagePlace !== undefined)
 
   // 获取英雄头像URL
   const getChampionIconUrl = (championId: number): string => {
@@ -520,7 +589,7 @@ export default function Build() {
           {MODES.map(mode => (
             <button
               key={mode.id}
-              onClick={() => setSelectedMode(mode.id)}
+              onClick={() => selectMode(mode.id)}
               className={`px-2.5 py-1.5 rounded text-xs font-medium transition-all duration-200 ${
                 selectedMode === mode.id
                   ? 'bg-gradient-to-b from-lol-gold to-lol-gold-dark text-lol-bg-primary shadow-gold'
@@ -686,6 +755,18 @@ export default function Build() {
                      selectedMode === 'aram-mayhem' ? '符文大乱斗' :
                      selectedMode === 'arena' ? '竞技场' : '排位'}
                   </span>
+                  {build.dataSource && (
+                    <span
+                      className={`px-2 py-0.5 text-[10px] rounded border ${
+                        build.dataSource.kind === 'fallback'
+                          ? 'bg-amber-500/10 text-amber-300 border-amber-500/30'
+                          : 'bg-lol-success/10 text-lol-success border-lol-success/30'
+                      }`}
+                      title={build.dataSource.details || build.dataSource.label}
+                    >
+                      {build.dataSource.kind === 'fallback' ? '替代数据' : '专属数据'} · {build.dataSource.label}
+                    </span>
+                  )}
                 </div>
               </div>
               
@@ -827,6 +908,57 @@ export default function Build() {
             </motion.div>
           )}
 
+          {(build.skills.masteries.length > 0 || build.skills.order.length > 0) && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.18 }}
+              className="lol-card p-3"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xs font-display text-lol-gold flex items-center gap-1.5 uppercase tracking-wider">
+                  <Swords size={12} />
+                  技能加点
+                </h3>
+                {build.skills.pickRate !== undefined && (
+                  <span className="text-[10px] text-lol-success">
+                    {formatPercent(build.skills.pickRate)} 选取率
+                  </span>
+                )}
+              </div>
+
+              {build.skills.masteries.length > 0 && (
+                <div className="flex items-center gap-1.5 mb-2">
+                  <span className="text-[10px] text-lol-text-muted mr-1">主升顺序</span>
+                  {build.skills.masteries.map((skill, index) => (
+                    <div key={`${skill}-${index}`} className="flex items-center gap-1.5">
+                      <span className={`w-7 h-7 rounded border flex items-center justify-center text-xs font-bold ${getSkillColor(skill)}`}>
+                        {skill.toUpperCase()}
+                      </span>
+                      {index < build.skills.masteries.length - 1 && (
+                        <span className="text-lol-text-muted text-xs">→</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {build.skills.order.length > 0 && (
+                <div className="flex items-center gap-1 flex-wrap">
+                  <span className="text-[10px] text-lol-text-muted mr-1">前 15 级</span>
+                  {build.skills.order.slice(0, 15).map((skill, index) => (
+                    <div key={`${skill}-${index}`} className="flex flex-col items-center gap-0.5">
+                      <span className={`w-6 h-6 rounded border flex items-center justify-center text-[10px] font-bold ${getSkillColor(skill)}`}>
+                        {skill.toUpperCase()}
+                      </span>
+                      <span className="text-[8px] text-lol-text-muted">{index + 1}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </motion.div>
+          )}
+
           {/* Items Section */}
           <motion.div
             initial={{ opacity: 0, y: 20 }}
@@ -918,6 +1050,11 @@ export default function Build() {
               }`}>
                 <Sparkles size={12} />
                 推荐强化符文
+                {selectedMode === 'aram-mayhem' && (
+                  <span className="ml-auto text-[9px] font-normal normal-case tracking-normal text-lol-text-muted">
+                    游戏内手动选择
+                  </span>
+                )}
               </h3>
               
               {/* 按稀有度分组显示 */}
@@ -951,6 +1088,9 @@ export default function Build() {
                                 {aug.name || `#${aug.id}`}
                               </span>
                               <span className="text-[10px] text-lol-success">{formatPercent(aug.pickRate)}</span>
+                              {!isAramMayhem && (
+                                <span className="text-[9px] text-lol-text-muted">#{aug.averagePlace.toFixed(1)}</span>
+                              )}
                             </div>
                           ))}
                         </div>
@@ -1099,6 +1239,17 @@ export default function Build() {
               </div>
             )}
           </div>
+
+          {tierDataSource && (
+            <div className={`mb-3 px-2.5 py-2 rounded border text-xs ${
+              tierDataSource.kind === 'fallback'
+                ? 'bg-amber-500/10 text-amber-200 border-amber-500/30'
+                : 'bg-lol-success/10 text-lol-success border-lol-success/30'
+            }`}>
+              数据来源：{tierDataSource.label}
+              {tierDataSource.details && <span className="text-lol-text-muted ml-2">{tierDataSource.details}</span>}
+            </div>
+          )}
           
           {tierLoading ? (
             <div className="flex items-center justify-center py-8">
@@ -1117,8 +1268,10 @@ export default function Build() {
                 <span className="flex-1">英雄</span>
                 <span className="w-14 text-center">胜率</span>
                 <span className="w-14 text-center">登场</span>
-                {(selectedMode === 'arena' || selectedMode === 'aram-mayhem') ? (
+                {showTierAveragePlace ? (
                   <span className="w-14 text-center">名次</span>
+                ) : selectedMode === 'aram-mayhem' ? (
+                  <span className="w-14 text-center">梯级</span>
                 ) : (
                   <span className="w-14 text-center">禁用</span>
                 )}
@@ -1173,9 +1326,13 @@ export default function Build() {
                   <span className="w-14 text-center text-sm text-lol-blue">
                     {formatPercent(champ.pickRate)}
                   </span>
-                  {(selectedMode === 'arena' || selectedMode === 'aram-mayhem') ? (
+                  {showTierAveragePlace ? (
                     <span className="w-14 text-center text-sm text-lol-gold">
                       #{champ.averagePlace?.toFixed(1) || '-'}
+                    </span>
+                  ) : selectedMode === 'aram-mayhem' ? (
+                    <span className="w-14 text-center text-sm text-amber-300">
+                      {champ.tier ? `T${champ.tier}` : '-'}
                     </span>
                   ) : (
                     <span className="w-14 text-center text-sm text-lol-text-muted">

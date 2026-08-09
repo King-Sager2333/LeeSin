@@ -38,6 +38,11 @@ export type GameFlowPhase =
   | 'EndOfGame'
   | 'TerminatedInError'
 
+export interface GameModeContext {
+  mode: string
+  queueId: number
+}
+
 // 英雄选择相关
 export interface ChampSelectSession {
   gameId: number
@@ -182,6 +187,8 @@ export interface LCUWebSocketEvent {
 }
 
 // 配置类型
+export type DataProxyMode = 'system' | 'direct' | 'manual'
+
 export interface AppSettings {
   autoAccept: boolean
   autoAcceptDelay: number
@@ -192,7 +199,18 @@ export interface AppSettings {
   bannedChampions: number[]
   region: string
   tier: string
-  gameMode: string  // ranked, aram, arena
+  gameMode: string  // ranked, aram, arena, aram-mayhem
+  dataProxyMode: DataProxyMode
+  dataProxyUrl: string
+}
+
+export interface DataProxyTestResult {
+  success: boolean
+  message: string
+  latencyMs?: number
+  route?: 'direct' | 'proxy'
+  version?: string
+  championCount?: number
 }
 
 // 战绩查询类型
@@ -288,7 +306,7 @@ export interface Augment {
 // IPC事件类型
 export interface IPCEvents {
   // LCU
-  'lcu:connected': { port: number; summoner: Summoner }
+  'lcu:connected': { port: number; summoner: Summoner | null }
   'lcu:disconnected': void
   'lcu:error': { message: string }
   

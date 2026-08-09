@@ -115,8 +115,10 @@ export class GameFlowMonitor extends EventEmitter {
         this.handleChampSelectStart()
         break
       case GAME_FLOW_PHASES.IN_PROGRESS:
+        this.handleChampSelectEnd(false)
+        break
       case GAME_FLOW_PHASES.NONE:
-        this.handleChampSelectEnd()
+        this.handleChampSelectEnd(true)
         break
     }
   }
@@ -154,14 +156,26 @@ export class GameFlowMonitor extends EventEmitter {
   private async detectGameMode(): Promise<void> {
     try {
       const gameflow = await this.lcuClient.get<any>('/lol-gameflow/v1/session')
-      if (gameflow?.gameData?.queue?.id) {
-        this.currentQueueId = gameflow.gameData.queue.id
-        this.currentGameMode = QUEUE_MODE_MAP[this.currentQueueId] || 'ranked'
-        Logger.info(`Detected game mode: ${this.currentGameMode} (queue: ${this.currentQueueId})`)
+      const queueId = gameflow?.gameData?.queue?.id || gameflow?.gameData?.queueId
+      if (queueId) {
+        const mode = QUEUE_MODE_MAP[queueId] || 'ranked'
+        this.updateGameMode(mode, queueId)
+        Logger.info(`Detected game mode: ${mode} (queue: ${queueId})`)
       }
     } catch (error) {
       Logger.error('Failed to detect game mode', error)
-      this.currentGameMode = 'ranked'
+      this.updateGameMode('ranked', 0)
+    }
+  }
+
+  private updateGameMode(mode: string, queueId: number): void {
+    const changed = mode !== this.currentGameMode || queueId !== this.currentQueueId
+    this.currentGameMode = mode
+    this.currentQueueId = queueId
+
+    if (changed) {
+      this.configService.set('gameMode', mode)
+      this.broadcastToRenderer('gameflow:mode-changed', { mode, queueId })
     }
   }
   
@@ -173,13 +187,13 @@ export class GameFlowMonitor extends EventEmitter {
     if (session.benchEnabled) {
       // 通过 queueId 区分普通 ARAM (450) 和 ARAM Mayhem (2400)
       if (this.currentQueueId === 2400) {
-        this.currentGameMode = 'aram-mayhem'
+        this.updateGameMode('aram-mayhem', this.currentQueueId)
       } else {
-        this.currentGameMode = 'aram'
+        this.updateGameMode('aram', this.currentQueueId)
       }
     } else if (session.myTeam?.length === 2) {
       // 2人队伍是竞技场模式
-      this.currentGameMode = 'arena'
+      this.updateGameMode('arena', this.currentQueueId)
     }
     
     Logger.debug(`Game mode determined: ${this.currentGameMode}`)
@@ -202,17 +216,21 @@ export class GameFlowMonitor extends EventEmitter {
     this.executeAutoBP(session)
   }
   
-  private handleChampSelectEnd(): void {
+  private handleChampSelectEnd(resetGameContext: boolean = false): void {
     Logger.info('Champion select ended')
     
     this.currentSession = null
     this.lastChampionId = 0
-    this.currentQueueId = 0
-    this.currentGameMode = 'ranked'
+    if (resetGameContext) {
+      this.updateGameMode('ranked', 0)
+    }
     this.phaseStartTime = 0
     this.phaseInitialRemaining = 0
     this.currentTimerPhase = ''
     this.stopTimerBroadcast()
+    this.autoBP.reset()
+    this.autoRune.reset()
+    this.autoSpell.reset()
   }
   
   private async executeAutoBP(session: ChampSelectSession): Promise<void> {
@@ -229,6 +247,10 @@ export class GameFlowMonitor extends EventEmitter {
   
   private async handleCurrentChampion(championId: number): Promise<void> {
     if (championId <= 0) return
+
+    if (this.currentQueueId === 0) {
+      await this.detectGameMode()
+    }
     
     Logger.info(`Current champion changed: ${championId}`)
     
@@ -236,7 +258,7 @@ export class GameFlowMonitor extends EventEmitter {
     const position = this.getCurrentPosition()
     
     // 执行自动符文
-    const runeResult = await this.autoRune.execute(championId, position)
+    const runeResult = await this.autoRune.execute(championId, position, this.currentGameMode)
     if (runeResult.executed) {
       this.broadcastToRenderer('automation:action-executed', {
         action: 'auto-rune',
@@ -246,7 +268,7 @@ export class GameFlowMonitor extends EventEmitter {
     }
     
     // 执行自动召唤师技能
-    const spellResult = await this.autoSpell.execute(championId, position)
+    const spellResult = await this.autoSpell.execute(championId, position, this.currentGameMode)
     if (spellResult.executed) {
       this.broadcastToRenderer('automation:action-executed', {
         action: 'auto-spell',

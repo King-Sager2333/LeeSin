@@ -6,6 +6,12 @@ interface StoreSchema {
   settings: AppSettings
 }
 
+const createDefaultSettings = (): AppSettings => ({
+  ...DEFAULT_SETTINGS,
+  preferredChampions: {},
+  bannedChampions: [],
+})
+
 export class ConfigService {
   private store: Store<StoreSchema>
   
@@ -13,13 +19,21 @@ export class ConfigService {
     this.store = new Store<StoreSchema>({
       name: 'leesin-config',
       defaults: {
-        settings: { ...DEFAULT_SETTINGS } as AppSettings,
+        settings: createDefaultSettings(),
       },
     })
   }
   
   getSettings(): AppSettings {
-    return this.store.get('settings')
+    const stored = this.store.get('settings')
+    return {
+      ...DEFAULT_SETTINGS,
+      ...stored,
+      preferredChampions: stored.preferredChampions || {},
+      bannedChampions: stored.bannedChampions || [],
+      dataProxyMode: stored.dataProxyMode || 'system',
+      dataProxyUrl: stored.dataProxyUrl || '',
+    } as AppSettings
   }
   
   setSettings(settings: Partial<AppSettings>): void {
@@ -40,7 +54,7 @@ export class ConfigService {
   
   // 重置为默认
   reset(): void {
-    this.store.set('settings', { ...DEFAULT_SETTINGS } as AppSettings)
+    this.store.set('settings', createDefaultSettings())
   }
   
   // 首选英雄设置

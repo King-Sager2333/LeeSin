@@ -21,11 +21,15 @@ export class AutoRune {
     this.configService = configService
   }
   
-  async execute(championId: number, position: string): Promise<AutoActionResult> {
+  async execute(championId: number, position: string, gameMode: string = 'ranked'): Promise<AutoActionResult> {
     const settings = this.configService.getSettings()
     
     if (!settings.autoRune) {
       return { executed: false, success: false, message: 'Auto-rune disabled' }
+    }
+
+    if (gameMode === 'arena') {
+      return { executed: false, success: false, message: '' }
     }
     
     // 防止重复设置同一英雄
@@ -36,11 +40,15 @@ export class AutoRune {
     try {
       // 从OP.GG获取推荐符文
       const normalizedPosition = POSITION_MAP[position] || 'mid'
+      const recommendationMode = ['ranked', 'aram', 'aram-mayhem'].includes(gameMode)
+        ? gameMode
+        : 'ranked'
       const build = await this.opggClient.getChampionBuild(
         championId, 
         normalizedPosition,
         settings.region,
-        settings.tier
+        settings.tier,
+        recommendationMode
       )
       
       if (!build || !build.runes || build.runes.length === 0) {

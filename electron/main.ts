@@ -9,6 +9,7 @@ import { Logger } from './services/logger'
 import { registerIPCHandlers } from './ipc/handlers'
 import { OPGGClient } from './core/data/opgg-client'
 import { StaticDataManager } from './core/data/static-data'
+import type { LCUCredentials } from '../shared/types'
 
 // 单例
 let mainWindow: BrowserWindow | null = null
@@ -62,6 +63,56 @@ function createWindow() {
   return mainWindow
 }
 
+async function handleLCUConnected(credentials: LCUCredentials): Promise<void> {
+  Logger.info(`LCU connected: port=${credentials.port}`)
+
+  const client = new LCUClient(credentials.port, credentials.token)
+  lcuClient = client
+
+  // 连接状态不能被静态数据或WebSocket初始化阻塞。
+  // 这些附加服务中的任意一个失败时，基础LCU API仍然可用。
+  try {
+    const summoner = await client.getCurrentSummoner()
+    if (lcuClient !== client) return
+    mainWindow?.webContents.send('lcu:connected', { port: credentials.port, summoner })
+  } catch (error) {
+    Logger.warn('Connected to LCU, but failed to get summoner info', error)
+    if (lcuClient !== client) return
+    mainWindow?.webContents.send('lcu:connected', { port: credentials.port, summoner: null })
+  }
+
+  const dataManager = new StaticDataManager(client)
+  staticDataManager = dataManager
+  try {
+    await dataManager.initialize()
+  } catch (error) {
+    Logger.warn('Static data initialization failed; continuing with LCU connection', error)
+  }
+  if (lcuClient !== client) return
+
+  const webSocket = new LCUWebSocket(credentials.port, credentials.token)
+  lcuWebSocket = webSocket
+  webSocket.on('error', (error) => {
+    Logger.warn('LCU WebSocket reported an error', error)
+  })
+
+  const monitor = new GameFlowMonitor(
+    client,
+    webSocket,
+    configService!,
+    opggClient!,
+    dataManager
+  )
+  gameFlowMonitor = monitor
+  monitor.start()
+
+  try {
+    await webSocket.connect()
+  } catch (error) {
+    Logger.warn('LCU WebSocket connection failed; HTTP connection remains available', error)
+  }
+}
+
 async function initializeServices() {
   Logger.info('Initializing services...')
 
@@ -69,44 +120,20 @@ async function initializeServices() {
   configService = new ConfigService()
   
   // OP.GG客户端
-  opggClient = new OPGGClient()
+  const initialSettings = configService.getSettings()
+  opggClient = new OPGGClient(
+    initialSettings.dataProxyMode || 'system',
+    initialSettings.dataProxyUrl || ''
+  )
 
   // LCU连接器
   lcuConnector = new LCUConnector()
   
   // 监听LCU连接事件
-  lcuConnector.on('connected', async (credentials) => {
-    Logger.info(`LCU connected: port=${credentials.port}`)
-    
-    // 初始化HTTP客户端
-    lcuClient = new LCUClient(credentials.port, credentials.token)
-    
-    // 初始化静态数据管理器
-    staticDataManager = new StaticDataManager(lcuClient)
-    await staticDataManager.initialize()
-    
-    // 初始化WebSocket
-    lcuWebSocket = new LCUWebSocket(credentials.port, credentials.token)
-    await lcuWebSocket.connect()
-    
-    // 初始化游戏流监控
-    gameFlowMonitor = new GameFlowMonitor(
-      lcuClient,
-      lcuWebSocket,
-      configService!,
-      opggClient!,
-      staticDataManager
-    )
-    gameFlowMonitor.start()
-    
-    // 获取召唤师信息
-    try {
-      const summoner = await lcuClient.getCurrentSummoner()
-      mainWindow?.webContents.send('lcu:connected', { port: credentials.port, summoner })
-    } catch (error) {
-      Logger.error('Failed to get summoner info', error)
-      mainWindow?.webContents.send('lcu:connected', { port: credentials.port, summoner: null })
-    }
+  lcuConnector.on('connected', (credentials: LCUCredentials) => {
+    void handleLCUConnected(credentials).catch((error) => {
+      Logger.error('Failed to initialize LCU services', error)
+    })
   })
   
   lcuConnector.on('disconnected', () => {

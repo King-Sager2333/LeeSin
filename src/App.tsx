@@ -75,19 +75,19 @@ function hasLocalPlayerLocked(session: ChampSelectSession): boolean {
 
 // 自动导航组件 - 必须在 Router 内部使用
 function AutoNavigator() {
-  const { phase } = useGameFlowStore()
+  const { phase, gameMode } = useGameFlowStore()
   const { session, setHasAutoNavigatedToBuild } = useChampSelectStore()
   const navigate = useNavigate()
   const location = useLocation()
   const prevPhaseRef = useRef(phase)
-  const [redirectedChampionId, setRedirectedChampionId] = useState<number>(0)
+  const [redirectedBuildKey, setRedirectedBuildKey] = useState('')
 
   // 进入选人阶段时自动跳转
   useEffect(() => {
     // 只有当 phase 从非 ChampSelect 变为 ChampSelect 时，才自动跳转
     if (phase === 'ChampSelect' && prevPhaseRef.current !== 'ChampSelect') {
       // 重置状态
-      setRedirectedChampionId(0)
+      setRedirectedBuildKey('')
       
       // 总是跳转到选人界面，除非已经在那里
       if (location.pathname !== '/champselect') {
@@ -104,27 +104,33 @@ function AutoNavigator() {
       const localPlayer = session.myTeam.find(p => p.cellId === session.localPlayerCellId)
       
       if (localPlayer && localPlayer.championId > 0) {
+        const buildKey = `${gameMode}:${localPlayer.championId}`
         // 判断是否应该跳转
         // 1. 英雄已锁定（经典模式）或 已选择（大乱斗模式）
-        // 2. 目标英雄ID与上次跳转的不同（防止重复跳转，同时支持大乱斗换人）
-        if (hasLocalPlayerLocked(session) && localPlayer.championId !== redirectedChampionId) {
-          setRedirectedChampionId(localPlayer.championId)
+        // 2. 英雄或模式发生变化（防止重复跳转，同时支持大乱斗换人与模式同步）
+        if (hasLocalPlayerLocked(session) && buildKey !== redirectedBuildKey) {
+          setRedirectedBuildKey(buildKey)
           const normalizedPos = normalizePosition(localPlayer.assignedPosition)
           
           // 延迟跳转，给用户一点反应时间，也确保数据就绪
           setTimeout(() => {
-            navigate(`/build?championId=${localPlayer.championId}&position=${normalizedPos}`)
+            const params = new URLSearchParams({
+              championId: localPlayer.championId.toString(),
+              position: normalizedPos,
+              mode: gameMode,
+            })
+            navigate(`/build?${params.toString()}`)
           }, 500)
         }
       }
     }
-  }, [session, phase, redirectedChampionId, navigate])
+  }, [session, phase, gameMode, redirectedBuildKey, navigate])
 
   // 当离开选人阶段时，重置标记
   useEffect(() => {
     if (phase !== 'ChampSelect') {
       setHasAutoNavigatedToBuild(false)
-      setRedirectedChampionId(0)
+      setRedirectedBuildKey('')
     }
   }, [phase, setHasAutoNavigatedToBuild])
 

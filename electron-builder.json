@@ -4,6 +4,7 @@
   "directories": {
     "output": "release"
   },
+  "afterPack": "scripts/after-pack.cjs",
   "files": [
     "dist/**/*",
     "dist-electron/**/*"
@@ -11,12 +12,17 @@
   "win": {
     "target": [
       {
-        "target": "7z",
+        "target": "portable",
         "arch": ["x64"]
       }
     ],
+    "artifactName": "${productName}-${version}-win-${arch}.${ext}",
     "icon": "resources/icon.ico",
-    "requestedExecutionLevel": "requireAdministrator"
+    "requestedExecutionLevel": "requireAdministrator",
+    "signAndEditExecutable": false
+  },
+  "portable": {
+    "requestExecutionLevel": "admin"
   },
   "nsis": {
     "oneClick": false,

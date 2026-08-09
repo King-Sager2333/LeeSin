@@ -87,6 +87,8 @@ export const DEFAULT_SETTINGS = {
   region: 'kr',
   tier: 'emerald_plus',
   gameMode: 'ranked',
+  dataProxyMode: 'system',
+  dataProxyUrl: '',
 } as const
 
 // 游戏模式

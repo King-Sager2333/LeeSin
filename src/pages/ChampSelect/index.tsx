@@ -1,17 +1,20 @@
 import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Clock, Users, Swords, ExternalLink } from 'lucide-react'
-import { useChampSelectStore, useDataStore, useGameFlowStore } from '../../store'
+import { Clock, Users, Swords, ExternalLink, RefreshCw } from 'lucide-react'
+import { useChampSelectStore, useDataStore, useGameFlowStore, useNotificationStore } from '../../store'
 import { useNavigate } from 'react-router-dom'
 import CareerDetail from '../../components/CareerDetail'
 import type { ChampSelectSession, ChampSelectPlayer } from '../../../shared/types'
 
 export default function ChampSelect() {
   const { session, timer } = useChampSelectStore()
-  const { phase } = useGameFlowStore()
+  const { phase, gameMode } = useGameFlowStore()
   const { champions } = useDataStore()
+  const { addNotification } = useNotificationStore()
   const navigate = useNavigate()
   const [selectedPlayer, setSelectedPlayer] = useState<ChampSelectPlayer | null>(null)
+  const [rerolling, setRerolling] = useState(false)
+  const [swappingChampionId, setSwappingChampionId] = useState<number | null>(null)
 
   const championsMap = new Map(champions.map(c => [c.id, c]))
 
@@ -31,7 +34,36 @@ export default function ChampSelect() {
   // 跳转到出装页面
   const goToBuildPage = (championId: number, position: string) => {
     const normalizedPos = normalizePosition(position)
-    navigate(`/build?championId=${championId}&position=${normalizedPos}`)
+    const params = new URLSearchParams({
+      championId: championId.toString(),
+      position: normalizedPos,
+      mode: gameMode,
+    })
+    navigate(`/build?${params.toString()}`)
+  }
+
+  const handleReroll = async () => {
+    setRerolling(true)
+    try {
+      const result = await window.electronAPI.champSelect.reroll()
+      addNotification(result.message, result.success ? 'success' : 'error')
+    } catch (error: any) {
+      addNotification(error.message || '重新随机失败', 'error')
+    } finally {
+      setRerolling(false)
+    }
+  }
+
+  const handleBenchSwap = async (championId: number) => {
+    setSwappingChampionId(championId)
+    try {
+      const result = await window.electronAPI.champSelect.swapBench(championId)
+      addNotification(result.message, result.success ? 'success' : 'error')
+    } catch (error: any) {
+      addNotification(error.message || '交换英雄失败', 'error')
+    } finally {
+      setSwappingChampionId(null)
+    }
   }
 
   // 自动选择自己为默认显示，并检测是否所有英雄已锁定
@@ -103,12 +135,61 @@ export default function ChampSelect() {
           </div>
         </div>
         
-        {isMyTurn && myAction && (
-          <div className="text-sm text-lol-gold font-display">
-            轮到你{myAction.type === 'ban' ? '禁用' : '选择'}英雄
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          <span className={`px-2 py-1 rounded text-[10px] font-medium ${
+            gameMode === 'aram-mayhem'
+              ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+              : 'bg-lol-bg-tertiary text-lol-text-secondary border border-lol-border'
+          }`}>
+            {gameMode === 'aram-mayhem' ? '符文大乱斗' : gameMode === 'aram' ? '极地大乱斗' : gameMode}
+          </span>
+
+          {session.allowRerolling && (
+            <button
+              onClick={handleReroll}
+              disabled={rerolling || session.rerollsRemaining <= 0}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-lol-gold/50 bg-lol-gold/10 text-xs text-lol-gold hover:bg-lol-gold/20 disabled:opacity-40 disabled:cursor-not-allowed"
+              title="重新随机英雄"
+            >
+              <RefreshCw size={13} className={rerolling ? 'animate-spin' : ''} />
+              重随 {session.rerollsRemaining}
+            </button>
+          )}
+
+          {isMyTurn && myAction && (
+            <div className="text-sm text-lol-gold font-display">
+              轮到你{myAction.type === 'ban' ? '禁用' : '选择'}英雄
+            </div>
+          )}
+        </div>
       </div>
+
+      {session.benchEnabled && session.benchChampions.length > 0 && (
+        <div className="lol-card px-3 py-2 flex items-center gap-2 flex-shrink-0 overflow-x-auto">
+          <span className="text-[10px] text-lol-text-muted whitespace-nowrap">备战席</span>
+          {session.benchChampions.map(champion => (
+            <button
+              key={champion.championId}
+              onClick={() => handleBenchSwap(champion.championId)}
+              disabled={swappingChampionId !== null}
+              className="group flex items-center gap-1.5 px-2 py-1 rounded bg-lol-bg-tertiary border border-lol-border hover:border-cyan-400/60 hover:bg-cyan-500/10 disabled:opacity-50 transition-colors"
+              title={`交换为${getChampionName(champion.championId)}`}
+            >
+              <img
+                src={getChampionIconUrl(champion.championId)}
+                alt={getChampionName(champion.championId)}
+                className="w-6 h-6 rounded-full"
+              />
+              <span className="text-[11px] text-lol-text-secondary group-hover:text-cyan-300 whitespace-nowrap">
+                {getChampionName(champion.championId)}
+              </span>
+              {swappingChampionId === champion.championId && (
+                <RefreshCw size={11} className="animate-spin text-cyan-300" />
+              )}
+            </button>
+          ))}
+        </div>
+      )}
       
       <div className="flex gap-3 flex-1 min-h-0">
         {/* 左侧：队伍信息 */}
@@ -295,4 +376,3 @@ function normalizePosition(position?: string): string {
   }
   return map[position.toLowerCase()] || 'mid'
 }
-

@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Save, RotateCcw, X, GripVertical } from 'lucide-react'
+import { Save, RotateCcw, X, GripVertical, Wifi, Loader2 } from 'lucide-react'
 import { useSettingsStore, useDataStore, useNotificationStore } from '../../store'
-import type { Champion } from '../../../shared/types'
+import type { Champion, DataProxyMode, DataProxyTestResult } from '../../../shared/types'
 
 const positions = [
   { id: 'top', label: '上单' },
@@ -23,6 +23,10 @@ export default function Settings() {
   const [searchQuery, setSearchQuery] = useState('')
   const [region, setRegion] = useState('kr')
   const [tier, setTier] = useState('emerald_plus')
+  const [dataProxyMode, setDataProxyMode] = useState<DataProxyMode>('system')
+  const [dataProxyUrl, setDataProxyUrl] = useState('')
+  const [testingProxy, setTestingProxy] = useState(false)
+  const [proxyTestResult, setProxyTestResult] = useState<DataProxyTestResult | null>(null)
   
   useEffect(() => {
     if (settings) {
@@ -30,6 +34,8 @@ export default function Settings() {
       setBannedChampions(settings.bannedChampions || [])
       setRegion(settings.region || 'kr')
       setTier(settings.tier || 'emerald_plus')
+      setDataProxyMode(settings.dataProxyMode || 'system')
+      setDataProxyUrl(settings.dataProxyUrl || '')
     }
   }, [settings])
   
@@ -76,6 +82,8 @@ export default function Settings() {
         bannedChampions,
         region,
         tier,
+        dataProxyMode,
+        dataProxyUrl,
       })
       
       // 更新store
@@ -86,6 +94,8 @@ export default function Settings() {
           bannedChampions,
           region,
           tier,
+          dataProxyMode,
+          dataProxyUrl,
         })
       }
       
@@ -106,7 +116,26 @@ export default function Settings() {
     setBannedChampions([])
     setRegion('kr')
     setTier('emerald_plus')
+    setDataProxyMode('system')
+    setDataProxyUrl('')
+    setProxyTestResult(null)
     addNotification('设置已重置', 'info')
+  }
+
+  const handleTestProxy = async () => {
+    setTestingProxy(true)
+    setProxyTestResult(null)
+    try {
+      const result = await window.electronAPI.settings.testDataProxy(dataProxyMode, dataProxyUrl)
+      setProxyTestResult(result)
+      addNotification(result.success ? '外部数据源连接成功' : result.message, result.success ? 'success' : 'error')
+    } catch {
+      const result = { success: false, message: '代理测试失败' }
+      setProxyTestResult(result)
+      addNotification(result.message, 'error')
+    } finally {
+      setTestingProxy(false)
+    }
   }
   
   return (
@@ -159,6 +188,63 @@ export default function Settings() {
               <option value="all">全段位</option>
             </select>
           </div>
+        </div>
+
+        <div className="mt-5 pt-5 border-t border-lol-border/50">
+          <div className="flex items-center gap-2 mb-3">
+            <Wifi className="w-4 h-4 text-cyan-400" />
+            <label className="text-sm text-lol-text-secondary">外部攻略数据代理</label>
+          </div>
+          <div className="grid grid-cols-[180px_1fr_auto] gap-3 items-center">
+            <select
+              value={dataProxyMode}
+              onChange={(event) => {
+                setDataProxyMode(event.target.value as DataProxyMode)
+                setProxyTestResult(null)
+              }}
+              className="lol-input w-full"
+            >
+              <option value="system">跟随系统（推荐）</option>
+              <option value="direct">强制直连</option>
+              <option value="manual">手动代理</option>
+            </select>
+            <input
+              type="text"
+              value={dataProxyUrl}
+              onChange={(event) => {
+                setDataProxyUrl(event.target.value)
+                setProxyTestResult(null)
+              }}
+              disabled={dataProxyMode !== 'manual'}
+              placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7891"
+              spellCheck={false}
+              className="lol-input w-full disabled:opacity-40"
+            />
+            <button
+              type="button"
+              onClick={handleTestProxy}
+              disabled={testingProxy || (dataProxyMode === 'manual' && !dataProxyUrl.trim())}
+              className="lol-button flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
+            >
+              {testingProxy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wifi className="w-4 h-4" />}
+              测试连接
+            </button>
+          </div>
+          <p className="mt-2 text-xs text-lol-text-muted">
+            仅用于 ARAMGG、OP.GG 和 CommunityDragon 等外部数据请求，不会代理本地 LOL 客户端连接。手动模式支持 HTTP、HTTPS、SOCKS4、SOCKS5。
+          </p>
+          {proxyTestResult && (
+            <div className={`mt-2 text-xs ${proxyTestResult.success ? 'text-lol-success' : 'text-lol-error'}`}>
+              {proxyTestResult.message}
+              {proxyTestResult.success && (
+                <span className="text-lol-text-muted ml-2">
+                  {proxyTestResult.version ? `版本 ${proxyTestResult.version}` : ''}
+                  {proxyTestResult.championCount ? ` · ${proxyTestResult.championCount} 个英雄` : ''}
+                  {proxyTestResult.latencyMs !== undefined ? ` · ${proxyTestResult.latencyMs} ms` : ''}
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
       
