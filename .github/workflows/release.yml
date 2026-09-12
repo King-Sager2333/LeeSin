@@ -36,6 +36,18 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
+      - name: Install 7-Zip
+        shell: pwsh
+        run: |
+          choco install 7zip 7zip.commandline -y
+          if (-not (Get-Command 7za -ErrorAction SilentlyContinue)) {
+            $7zDir = "C:\Program Files\7-Zip"
+            if (Test-Path "$7zDir\7z.exe") {
+              Copy-Item "$7zDir\7z.exe" "$7zDir\7za.exe" -Force
+              echo "$7zDir" >> $env:GITHUB_PATH
+            }
+          }
+
       - name: Install dependencies
         run: npm ci
 
